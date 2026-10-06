@@ -1,0 +1,16 @@
+{
+    "required": true,
+    "minVersion": "0.8",
+    "package": "com.stronger.shulkerbox.mixin",
+    "compatibilityLevel": "JAVA_16",
+    "refmap": "strongershulkerbox.refmap.json",
+    "mixins": [
+        "BlockItemMixin",
+        "ShulkerBoxSlotMixin",
+        "ShulkerBoxBlockEntityMixin",
+        "SlotMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

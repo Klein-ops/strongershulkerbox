@@ -1,0 +1,26 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="strongershulkerbox"
+version="1.1.0"
+displayName="更强的潜影盒"
+authors="StrongerShulkerBox"
+description='''
+潜影盒里面可以放潜影盒，最多支持嵌套 5 层。
+'''
+[[mixins]]
+config="strongershulkerbox.mixins.json"
+[[dependencies.strongershulkerbox]]
+    modId="neoforge"
+    type="required"
+    versionRange="[21.1.176,)"
+    ordering="NONE"
+    side="BOTH"
+[[dependencies.strongershulkerbox]]
+    modId="minecraft"
+    type="required"
+    versionRange="[1.21.1,1.21.2)"
+    ordering="NONE"
+    side="BOTH"
