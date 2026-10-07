@@ -77,6 +77,17 @@ public class ShulkerBoxStackManager {
         }
     }
 
+    /** 当前有打开链的玩家集合（只读视图，用于一致性巡检）。 */
+    public static java.util.Set<ServerPlayer> trackedPlayers() {
+        return STACKS.keySet();
+    }
+
+    /** 某玩家当前的打开链（只读遍历用；无则空）。 */
+    public static Deque<ShulkerBoxItemContainer> chainOf(ServerPlayer player) {
+        Deque<ShulkerBoxItemContainer> stack = STACKS.get(player);
+        return stack == null ? new ConcurrentLinkedDeque<>() : stack;
+    }
+
     /**
      * 该玩家当前打开链中，是否存在「宿主物品恰为 stack（按对象同一性）」的容器。
      * 用于 mayPickup(Player) 这类「精确到具体玩家」的校验。

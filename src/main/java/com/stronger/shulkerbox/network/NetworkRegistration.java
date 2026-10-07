@@ -18,6 +18,7 @@ import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerContainerEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
 import net.neoforged.neoforge.network.handling.IPayloadHandler;
@@ -39,11 +40,39 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
  * 真实容器内容逐槽同步给客户端，客户端仅用空 SimpleContainer(27) 做展示框架。
  */
 public class NetworkRegistration {
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger("strongershulkerbox");
+
+    /**
+     * 待重开的上层容器（延迟到下一个服务端 tick 再打开）。
+     *
+     * 为什么不能在 Close 事件里同步重开：
+     *   原版 {@code ServerPlayer.doCloseContainer()} 的执行顺序是
+     *     containerMenu.removed(player) → inventoryMenu.transferState(containerMenu)
+     *     → 广播 PlayerContainerEvent.Close → containerMenu = inventoryMenu
+     *   而我们正是从这个 Close 事件里被调用的。事件返回之后，原版紧接着执行
+     *   {@code containerMenu = inventoryMenu}，会把我们刚 openMenu 出来的新菜单
+     *   直接覆盖掉，造成「服务端菜单 ≠ 客户端界面」的错位。
+     *
+     * 错位的致命后果（v1.2.4 根因）：
+     *   客户端界面的菜单 id 与服务端当前菜单 id 不一致后，客户端发来的点击包
+     *   里的「槽位号」会被服务端按错误的菜单解读（槽位号错位别名），
+     *   于是物品被搬进完全不同的槽位；更糟的是服务端对 id 不匹配的点击是
+     *   「静默忽略」（无日志），玩家看到的是客户端预测结果，两者越走越远。
+     *   本次存档取证中「宿主 X 所在槽位被它自己的子盒顶替、X 及其余子盒消失」
+     *   就是这条路径造成的。
+     *
+     * 因此这里只登记「待重开」，等关闭流程彻底结束后，由
+     * {@link #onServerTick(net.neoforged.neoforge.event.tick.ServerTickEvent.Post)} 再打开。
+     */
+    private static final java.util.Map<ServerPlayer, ShulkerBoxItemContainer> PENDING_REOPEN =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     public static void register(IEventBus modEventBus) {
         modEventBus.addListener(NetworkRegistration::registerPayloads);
-        // 游戏事件（Close / 登出）发在游戏总线 NeoForge.EVENT_BUS，需要手动注册
+        // 游戏事件（Close / 登出 / 每 tick 巡检）发在游戏总线 NeoForge.EVENT_BUS，需要手动注册
         NeoForge.EVENT_BUS.addListener(NetworkRegistration::onPlayerContainerClose);
         NeoForge.EVENT_BUS.addListener(NetworkRegistration::onPlayerLoggedOut);
+        NeoForge.EVENT_BUS.addListener(NetworkRegistration::onServerTick);
     }
 
     private static void registerPayloads(RegisterPayloadHandlersEvent event) {
@@ -112,6 +141,17 @@ public class NetworkRegistration {
                 inventory
         );
 
+        // 安全网：openMenu 在「当前菜单就是玩家自己的背包菜单」时会跳过关闭流程，
+        // 导致光标上的物品被永久滞留（既不在背包、也不在新菜单里，退出存档即丢失）。
+        // 因此在切换前，先把背包菜单光标上的物品放回背包。
+        returnStrandedCursorItem(player);
+
+        LOGGER.info("[SB-LIFE] open {} host={} chain={} at {}",
+                fromShulker ? "nested" : "top",
+                stack.getItem(),
+                ShulkerBoxStackManager.stackOf(player).size(),
+                (parentContainer != null ? "parent#" : "inv#") + parentSlot);
+
         // 标记「正在切换菜单」，避免 openMenu 隐式关闭旧菜单时被 Close 事件误判为 ESC
         ShulkerBoxStackManager.setSwitching(player, true);
         try {
@@ -121,6 +161,29 @@ public class NetworkRegistration {
         } finally {
             ShulkerBoxStackManager.setSwitching(player, false);
         }
+    }
+
+    /**
+     * 把玩家「背包菜单」光标上的物品放回背包，避免它在菜单切换时被滞留丢失。
+     *
+     * 背景：原版 ServerPlayer.openMenu 只有在 containerMenu != inventoryMenu 时才会
+     * 关闭旧菜单（进而通过 removed() 把光标物品交还背包）。若当前菜单恰好就是背包菜单，
+     * 则该关闭被跳过，光标物品会一直留在 inventoryMenu 里——新菜单的光标是空的，
+     * 于是这件物品既看不见也拿不回，退出存档后彻底丢失。
+     */
+    private static void returnStrandedCursorItem(ServerPlayer player) {
+        AbstractContainerMenu menu = player.containerMenu;
+        if (menu != player.inventoryMenu) {
+            return;
+        }
+        ItemStack carried = menu.getCarried();
+        if (carried.isEmpty()) {
+            return;
+        }
+        menu.setCarried(ItemStack.EMPTY);
+        player.getInventory().placeItemBackInInventory(carried);
+        player.getInventory().setChanged();
+        LOGGER.warn("[SB-FIX] returned stranded cursor item {} to inventory", carried.getItem());
     }
 
     /** 打开一个潜影盒菜单（复用原版 ShulkerBoxMenu） */
@@ -155,18 +218,70 @@ public class NetworkRegistration {
         if (ShulkerBoxStackManager.isSwitching(serverPlayer)) {
             return; // 正在切换菜单（嵌套打开/回退重开），不弹栈
         }
+        // 已经有一次「待重开」挂起（ESC 关闭 → 下一个 tick 重开之间的空档），
+        // 期间玩家若又关掉了中间态的背包菜单，这里必须忽略，否则会把栈顶也弹掉。
+        if (PENDING_REOPEN.containsKey(serverPlayer)) {
+            return;
+        }
         // 栈为空说明不是我们的潜影盒菜单，忽略
         if (ShulkerBoxStackManager.peek(serverPlayer) == null) {
             return;
         }
-        // 弹栈：返回上一层；若弹栈后仍有栈顶容器，则重开它
+        // 弹栈：返回上一层；若弹栈后仍有栈顶容器，则「延迟」重开它。
+        // 绝不在此处同步 openMenu——原因见 PENDING_REOPEN 字段注释。
         ShulkerBoxItemContainer parent = ShulkerBoxStackManager.pop(serverPlayer);
         if (parent != null) {
-            ShulkerBoxStackManager.setSwitching(serverPlayer, true);
-            try {
-                openMenu(serverPlayer, parent);
-            } finally {
-                ShulkerBoxStackManager.setSwitching(serverPlayer, false);
+            PENDING_REOPEN.put(serverPlayer, parent);
+        }
+    }
+
+    /**
+     * 每个服务端 tick 收尾时做两件事：
+     *
+     * 1) 执行「延迟重开」：把上一次 ESC 弹栈后应返回的上层菜单打开。
+     *    此时原版 doCloseContainer() 的最后一行 `containerMenu = inventoryMenu`
+     *    已经执行完毕，我们打开的菜单不会再被覆盖，端-服菜单始终一致。
+     *
+     * 2) 一致性巡检：遍历每个玩家打开链，检查链中每个宿主的潜影盒物品是否
+     *    仍留在它的父容器里（按对象同一性）。一旦发现「宿主被顶替/移走」，
+     *    立即告警——这正是本次「吞物品」在存档层面留下的形态。
+     */
+    public static void onServerTick(ServerTickEvent.Post event) {
+        var server = event.getServer();
+        if (server == null) {
+            return;
+        }
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            // 1) 延迟重开上层菜单
+            ShulkerBoxItemContainer pending = PENDING_REOPEN.remove(player);
+            if (pending != null) {
+                if (player.hasDisconnected() || player.isRemoved()) {
+                    ShulkerBoxStackManager.clear(player);
+                    continue;
+                }
+                // openMenu 在「当前菜单就是背包菜单」时会跳过关闭流程，
+                // 光标上的物品同样需要先交还背包（双重保险，避免滞留）。
+                returnStrandedCursorItem(player);
+                ShulkerBoxStackManager.setSwitching(player, true);
+                try {
+                    openMenu(player, pending);
+                    LOGGER.info("[SB-LIFE] reopen parent host={} chain={}",
+                            pending.getShulkerBoxStack().getItem(),
+                            ShulkerBoxStackManager.stackOf(player).size());
+                } catch (RuntimeException ex) {
+                    LOGGER.error("[SB-ALERT] failed to reopen parent shulker box {}",
+                            pending.getShulkerBoxStack().getItem(), ex);
+                } finally {
+                    ShulkerBoxStackManager.setSwitching(player, false);
+                }
+            }
+
+            // 2) 一致性巡检：打开链中的宿主必须仍在父容器里
+            for (ShulkerBoxItemContainer container : ShulkerBoxStackManager.chainOf(player)) {
+                if (!container.hostStillPresent() && container.markLostAlertOnce()) {
+                    LOGGER.warn("[SB-ALERT] open-chain host {} vanished from its parent (recorded slot {}) - item may be lost",
+                            container.getShulkerBoxStack().getItem(), container.getSlotIndex());
+                }
             }
         }
     }
@@ -175,6 +290,7 @@ public class NetworkRegistration {
     public static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
         Player player = event.getEntity();
         if (player instanceof ServerPlayer serverPlayer) {
+            PENDING_REOPEN.remove(serverPlayer);
             ShulkerBoxStackManager.clear(serverPlayer);
         }
     }

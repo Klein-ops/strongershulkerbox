@@ -45,9 +45,6 @@ public class ShulkerBoxItemContainer implements Container {
     private static final Set<ItemStack> CLIENT_OPEN =
             Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
 
-    /** 临时诊断：每个被判定为「打开中」的物品只打印一次，用于定位误锁。 */
-    private static final Set<ItemStack> DIAG_LOGGED =
-            Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
     private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger("strongershulkerbox");
 
     public static void markOpenClient(ItemStack stack) {
@@ -82,11 +79,7 @@ public class ShulkerBoxItemContainer implements Container {
         }
         boolean clientHit = CLIENT_OPEN.contains(stack);
         boolean hostHit = player instanceof ServerPlayer sp && ShulkerBoxStackManager.isOpenHost(sp, stack);
-        boolean locked = clientHit || hostHit;
-        if (locked && DIAG_LOGGED.add(stack)) {
-            LOGGER.info("[SB-DIAG] lock item={} clientHit={} openHost={}", stack.getItem(), clientHit, hostHit);
-        }
-        return locked;
+        return clientHit || hostHit;
     }
 
     /** 权威后备存储（可变） */
@@ -266,10 +259,69 @@ public class ShulkerBoxItemContainer implements Container {
         shulkerBoxStack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(items));
         if (parent instanceof Inventory inv) {
             // 同一个对象，改组件已就地生效；这里只做同步标记，绝不新建/复制物品
+            // 安全网：确认宿主物品仍在背包里（按对象同一性）。若被挪位就更新槽位记录，
+            // 若彻底找不到则告警——用于定位「宿主被顶替/丢失」类问题。
+            int actual = findSlot(inv);
+            if (actual >= 0) {
+                slotIndex = actual;
+            } else {
+                LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) is NOT in player inventory any more",
+                        shulkerBoxStack.getItem(), slotIndex);
+            }
             inv.setChanged();
         } else if (parent != null) {
             // 嵌套：父容器已持有本物品对象，触发其重新序列化即可逐级向上传播
             parent.setChanged();
         }
+    }
+
+    /** 在背包里按对象同一性查找本宿主物品所在槽位，找不到返回 -1。 */
+    private int findSlot(Inventory inv) {
+        int size = inv.getContainerSize();
+        for (int i = 0; i < size; i++) {
+            if (inv.getItem(i) == shulkerBoxStack) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 宿主的父容器（背包或父级潜影盒容器）。 */
+    public Container getParent() {
+        return parent;
+    }
+
+    /** 宿主在父容器中的槽位记录（可能随写回自动校正）。 */
+    public int getSlotIndex() {
+        return slotIndex;
+    }
+
+    /**
+     * 宿主物品是否仍存在于其父容器中（按对象同一性）。
+     * 用于每个 tick 的一致性检查：一旦宿主被移出/顶替，立即告警。
+     */
+    public boolean hostStillPresent() {
+        Container p = parent;
+        if (p == null || shulkerBoxStack == null || shulkerBoxStack.isEmpty()) {
+            return true;
+        }
+        int size = p.getContainerSize();
+        for (int i = 0; i < size; i++) {
+            if (p.getItem(i) == shulkerBoxStack) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean lostAlertLogged = false;
+
+    /** 仅在第一次发现宿主丢失时返回 true（避免每 tick 刷屏）。 */
+    public boolean markLostAlertOnce() {
+        if (lostAlertLogged) {
+            return false;
+        }
+        lostAlertLogged = true;
+        return true;
     }
 }
