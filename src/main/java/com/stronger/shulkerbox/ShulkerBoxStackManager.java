@@ -12,6 +12,9 @@ import java.util.Map;
  *
  * 栈底 = 顶层潜影盒（从背包打开），栈顶 = 当前正在展示的最深层潜影盒。
  * 嵌套打开时压栈；按 ESC 关闭时弹栈并重开上一层，实现「逐层返回」。
+ *
+ * v1.2.0：压栈/弹栈/清理时同步维护「正在打开的潜影盒物品」标记，
+ * 供 ShulkerBoxSlot#mayPlace 拦截自包含/祖先包含（吞物品根因之一）。
  */
 public class ShulkerBoxStackManager {
     private static final Map<ServerPlayer, Deque<ShulkerBoxItemContainer>> STACKS = new HashMap<>();
@@ -33,9 +36,10 @@ public class ShulkerBoxStackManager {
         return Boolean.TRUE.equals(SWITCHING.get(player));
     }
 
-    /** 压栈：打开更深一层 */
+    /** 压栈：打开更深一层，并登记该潜影盒物品为「正在打开」 */
     public static void push(ServerPlayer player, ShulkerBoxItemContainer container) {
         stackOf(player).push(container);
+        ShulkerBoxItemContainer.markOpenServer(container.getShulkerBoxStack());
     }
 
     /** 弹栈：返回上一层，返回 null 表示已到栈底（应回背包） */
@@ -44,7 +48,8 @@ public class ShulkerBoxStackManager {
         if (stack.isEmpty()) {
             return null;
         }
-        stack.pop();
+        ShulkerBoxItemContainer removed = stack.pop();
+        ShulkerBoxItemContainer.unmarkOpenServer(removed.getShulkerBoxStack());
         return stack.peek();
     }
 
@@ -55,13 +60,22 @@ public class ShulkerBoxStackManager {
 
     /** 玩家退出/断线时清理 */
     public static void clear(ServerPlayer player) {
-        STACKS.remove(player);
+        Deque<ShulkerBoxItemContainer> stack = STACKS.remove(player);
+        if (stack != null) {
+            for (ShulkerBoxItemContainer c : stack) {
+                ShulkerBoxItemContainer.unmarkOpenServer(c.getShulkerBoxStack());
+            }
+        }
         SWITCHING.remove(player);
     }
+
     /** 仅清空打开栈（不清 switching 标志）：用于「从背包重新打开」时重置链路 */
     public static void clearStack(ServerPlayer player) {
         Deque<ShulkerBoxItemContainer> stack = STACKS.get(player);
         if (stack != null) {
+            for (ShulkerBoxItemContainer c : stack) {
+                ShulkerBoxItemContainer.unmarkOpenServer(c.getShulkerBoxStack());
+            }
             stack.clear();
         }
     }
