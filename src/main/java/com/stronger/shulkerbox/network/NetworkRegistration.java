@@ -276,11 +276,19 @@ public class NetworkRegistration {
                 }
             }
 
-            // 2) 一致性巡检：打开链中的宿主必须仍在父容器里
+            // 2) 一致性巡检：打开链中的宿主必须仍在父容器里。
+            //    v1.2.6：先尝试重定位宿主（v1.2.5 机制），若失败（宿主彻底丢失/有歧义，
+            //    例如背包里有多个同类型盒子无法唯一判定）→ 强制关闭该玩家的潜影盒菜单，
+            //    堵死「继续写孤儿对象」的复制窗口。玩家重开后从真实对象重新构造。
             for (ShulkerBoxItemContainer container : ShulkerBoxStackManager.chainOf(player)) {
-                if (!container.hostStillPresent() && container.markLostAlertOnce()) {
-                    LOGGER.warn("[SB-ALERT] open-chain host {} vanished from its parent (recorded slot {}) - item may be lost",
+                if (!container.tryRelocateForCheck()) {
+                    LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) lost beyond repair - force closing shulker menu",
                             container.getShulkerBoxStack().getItem(), container.getSlotIndex());
+                    PENDING_REOPEN.remove(player);
+                    ShulkerBoxStackManager.setSwitching(player, false);
+                    ShulkerBoxStackManager.clearStack(player);
+                    player.closeContainer();
+                    break; // 已强制关闭，跳过其余链项
                 }
             }
         }

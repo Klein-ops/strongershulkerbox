@@ -264,7 +264,11 @@ public class ShulkerBoxItemContainer implements Container {
     private void writeBack() {
         // v1.2.5：先重定位宿主（若被外部操作替换成新对象，则接管真实对象），
         // 再写入内容，避免写回落在孤儿对象上造成「取出不消失」的复制。
-        relocateHost();
+        // v1.2.6：重定位失败（宿主彻底丢失 / 有歧义）时宁可不写，也不写孤儿对象；
+        // 每 tick 巡检会据此强制关屏，玩家重开后从真实对象重新构造。
+        if (!relocateHost()) {
+            return;
+        }
         if (shulkerBoxStack != null && !shulkerBoxStack.isEmpty()) {
             shulkerBoxStack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(items));
         }
@@ -312,10 +316,13 @@ public class ShulkerBoxItemContainer implements Container {
      *  - 对象已被替换（一键整理等会重建堆叠对象）：接管父容器中「唯一同类型」的
      *    替换对象（优先记录槽位，其次全容器唯一匹配），让后续写回落在真实对象上；
      *  - 找不到 / 有歧义：保持原引用，仅告警（延续 v1.2.4 探针行为）。
+     *
+     * @return true 表示重定位成功（宿主仍可用）；false 表示彻底丢失/有歧义
+     *         （v1.2.6：调用方应据此强制关闭菜单，堵死「继续写孤儿对象」的复制窗口）
      */
-    private void relocateHost() {
+    private boolean relocateHost() {
         if (parent == null || shulkerBoxStack == null || shulkerBoxStack.isEmpty()) {
-            return;
+            return true;
         }
         // 同一性优先：宿主对象仍在父容器中（可能被挪到别的槽位）
         int idSlot = findSlot(parent);
@@ -323,7 +330,7 @@ public class ShulkerBoxItemContainer implements Container {
             if (idSlot != slotIndex) {
                 slotIndex = idSlot;
             }
-            return;
+            return true;
         }
         // 对象被替换：尝试接管真实对象
         ItemStack replacement = findReplacement(parent);
@@ -333,11 +340,22 @@ public class ShulkerBoxItemContainer implements Container {
                     replacement.getItem(), slotIndex, repSlot);
             shulkerBoxStack = replacement;
             slotIndex = repSlot;
-            return;
+            return true;
         }
         // 彻底找不到：延续 v1.2.4 告警，用于定位「宿主被顶替/丢失」
-        LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) is NOT in player inventory any more",
-                shulkerBoxStack.getItem(), slotIndex);
+        if (markLostAlertOnce()) {
+            LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) is NOT in player inventory any more",
+                    shulkerBoxStack.getItem(), slotIndex);
+        }
+        return false;
+    }
+
+    /**
+     * 供每 tick 一致性巡检使用：尝试重定位宿主。
+     * 返回 false 表示宿主已从父容器彻底消失/有歧义，调用方应强制关闭玩家菜单。
+     */
+    public boolean tryRelocateForCheck() {
+        return relocateHost();
     }
 
     /**
