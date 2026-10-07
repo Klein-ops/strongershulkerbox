@@ -22,21 +22,28 @@ import net.neoforged.neoforge.network.PacketDistributor;
 /**
  * 客户端：在背包/潜影盒界面内右键潜影盒物品，请求服务端打开其 GUI。
  *
- * 判定规则：
- *  - 当前屏幕是 ShulkerBoxScreen（已在潜影盒界面内）：悬停槽位若属于
- *    潜影盒内部（槽位容器不是玩家背包），右键 → fromShulker=true，槽位号为
- *    slot.getContainerSlot()（0-26）；
- *  - 其他屏幕（背包 InventoryScreen 等）：悬停槽位若属于玩家背包/快捷栏
- *    （槽位容器是玩家背包或槽位索引 < 36），右键 → fromShulker=false，槽位号为
- *    Inventory 槽位号。
+ * v1.2.2：客户端本地登记「正在打开的潜影盒」，使客户端的
+ * Slot#mayPickup / #mayPlace 与服务端一致地锁死该盒子，
+ * 避免服务端拒绝、客户端却已预测移动造成的状态漂移（假物品/回弹）。
  *
- * v1.2.0：额外在客户端本地登记「正在打开的潜影盒物品」，使客户端
- * ShulkerBoxSlot#mayPlace 与服务端一致地拦截自包含/祖先包含（避免预测分歧）。
+ * 标记时序（关键）：
+ *  - 发出顶层打开请求时登记该盒子，并进入「等待潜影盒界面」状态；
+ *  - 等待期间（服务端往返，通常 1~2 tick）保留标记，避免空档被误清；
+ *  - 进入潜影盒界面后结束等待；离开界面后再短暂观察几 tick（嵌套逐层返回会
+ *    重新进入潜影盒界面，此时应保留标记），否则清空标记解锁。
  */
 @EventBusSubscriber(modid = StrongerShulkerBoxMod.MODID, bus = EventBusSubscriber.Bus.GAME, value = Dist.CLIENT)
 public class ShulkerBoxClientEvents {
     private ShulkerBoxClientEvents() {
     }
+
+    /** 已发出打开请求、等待潜影盒界面出现 */
+    private static boolean awaitingScreen = false;
+    private static int awaitingTicks = 0;
+    /** 刚离开潜影盒界面，短暂观察是否为「嵌套逐层返回」 */
+    private static boolean bridging = false;
+    private static int bridgingTicks = 0;
+    private static boolean wasInShulker = false;
 
     @SubscribeEvent
     public static void onMousePressed(ScreenEvent.MouseButtonPressed.Pre event) {
@@ -63,33 +70,69 @@ public class ShulkerBoxClientEvents {
             return; // 悬停的不是潜影盒
         }
         // 判定来源：是否在潜影盒界面内且悬停的是潜影盒内部槽位
-        // （ShulkerBoxMenu 中潜影盒内部槽位容器是同步的空容器，背包槽位容器是 Inventory）
         boolean fromShulker = screen instanceof ShulkerBoxScreen
                 && !(slot.container instanceof Inventory);
-        // 槽位号：getContainerSlot() 直接返回容器内索引
-        //  潜影盒内部 = 0-26；背包/快捷栏 = 0-35
         int slotIndex = slot.getContainerSlot();
 
-        // 客户端本地标记：顶层打开时重置链路并登记源物品，使客户端校验与服务端一致
+        // 客户端本地登记：顶层打开时重置链路并登记源物品
         if (!fromShulker) {
             ShulkerBoxItemContainer.clearOpenClient();
             ShulkerBoxItemContainer.markOpenClient(stack);
         }
+        awaitingScreen = true;
+        awaitingTicks = 0;
+        bridging = false;
+        bridgingTicks = 0;
 
         // 阻止原版处理（避免同时触发拖拽/移动），并请求服务端打开
         event.setCanceled(true);
         PacketDistributor.sendToServer(new ShulkerBoxOpenPayload(fromShulker, slotIndex));
     }
 
-    /**
-     * 客户端侧清理：当不再处于潜影盒界面时，清空本地「正在打开」标记
-     *（嵌套逐层返回时仍处于潜影盒界面，标记保留）。
-     */
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
         Minecraft mc = Minecraft.getInstance();
-        if (!(mc.screen instanceof ShulkerBoxScreen)) {
-            ShulkerBoxItemContainer.clearOpenClient();
+        boolean inShulker = mc.screen instanceof ShulkerBoxScreen;
+
+        if (inShulker) {
+            wasInShulker = true;
+            awaitingScreen = false;
+            awaitingTicks = 0;
+            bridging = false;
+            bridgingTicks = 0;
+            return;
         }
+
+        if (wasInShulker) {
+            // 刚从潜影盒界面离开：可能是嵌套逐层返回，先观察几 tick 再决定是否解锁
+            wasInShulker = false;
+            awaitingScreen = false;
+            awaitingTicks = 0;
+            bridging = true;
+            bridgingTicks = 0;
+            return;
+        }
+
+        if (awaitingScreen) {
+            // 等待服务端打开界面期间保留标记；超时（界面迟迟不来）则放弃并解锁
+            if (++awaitingTicks > 60) {
+                awaitingScreen = false;
+                awaitingTicks = 0;
+                ShulkerBoxItemContainer.clearOpenClient();
+            }
+            return;
+        }
+
+        if (bridging) {
+            if (++bridgingTicks > 5) {
+                bridging = false;
+                bridgingTicks = 0;
+                ShulkerBoxItemContainer.clearOpenClient();
+            }
+            return;
+        }
+
+        // 不在潜影盒界面：解锁
+        ShulkerBoxItemContainer.clearOpenClient();
     }
 }
