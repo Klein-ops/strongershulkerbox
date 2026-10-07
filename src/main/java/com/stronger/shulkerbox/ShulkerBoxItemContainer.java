@@ -231,29 +231,22 @@ public class ShulkerBoxItemContainer implements Container {
         return false;
     }
 
-    /** 把权威 items 序列化回潜影盒物品，并逐级写回父容器。 */
+    /**
+     * 把权威 items 序列化回潜影盒物品，并向上传播。
+     *
+     * v1.2.1 关键修复（物品复制漏洞）：
+     *  顶层时，写回的潜影盒物品就是背包槽位里的「同一个对象」——修改它的组件
+     *  已经就地生效。因此这里【绝不能】再调用 inv.setItem 把它写回槽位：
+     *  一旦物品此刻不在原槽位（例如被玩家用手抓着、或挪到了别处），
+     *  旧代码会把它重新塞回原槽，凭空多出一个潜影盒，形成复制。
+     */
     private void writeBack() {
         shulkerBoxStack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(items));
         if (parent instanceof Inventory inv) {
-            // 顶层：物品可能已被玩家在 GUI 内挪到别的槽位，先按对象找回，避免重复/丢失
-            if (inv.getItem(slotIndex) != shulkerBoxStack) {
-                int found = -1;
-                for (int s = 0; s < inv.getContainerSize(); s++) {
-                    if (inv.getItem(s) == shulkerBoxStack) {
-                        found = s;
-                        break;
-                    }
-                }
-                if (found >= 0) {
-                    slotIndex = found;
-                } else {
-                    // 找不到（被移走/销毁），放回原槽，保证不丢失
-                    inv.setItem(slotIndex, shulkerBoxStack);
-                }
-            }
+            // 同一个对象，改组件已就地生效；这里只做同步标记，绝不新建/复制物品
             inv.setChanged();
-        } else {
-            parent.setItem(slotIndex, shulkerBoxStack);
+        } else if (parent != null) {
+            // 嵌套：父容器已持有本物品对象，触发其重新序列化即可逐级向上传播
             parent.setChanged();
         }
     }
