@@ -84,8 +84,14 @@ public class ShulkerBoxItemContainer implements Container {
 
     /** 权威后备存储（可变） */
     private final NonNullList<ItemStack> items;
-    /** 写回目标的潜影盒物品（就是背包/父容器里的那个真实对象） */
-    private final ItemStack shulkerBoxStack;
+    /**
+     * 写回目标的潜影盒物品（就是背包/父容器里的那个真实对象）。
+     *
+     * v1.2.5 起不再 final：打开期间若有外部操作（一键整理等会重建堆叠对象）
+     * 把槽位里的宿主替换成新实例，writeBack 会在重定位时把本引用指向新宿主，
+     * 保证写回永远作用于「背包中真实存在的对象」，而不是被替换掉的孤儿对象。
+     */
+    private ItemStack shulkerBoxStack;
     /** 父容器（背包 Inventory 或父级 ShulkerBoxItemContainer） */
     private final Container parent;
     /** 本物品在父容器中的槽位；可能因玩家在 GUI 内挪动而重定位 */
@@ -256,30 +262,33 @@ public class ShulkerBoxItemContainer implements Container {
      *  旧代码会把它重新塞回原槽，凭空多出一个潜影盒，形成复制。
      */
     private void writeBack() {
-        shulkerBoxStack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(items));
-        if (parent instanceof Inventory inv) {
-            // 同一个对象，改组件已就地生效；这里只做同步标记，绝不新建/复制物品
-            // 安全网：确认宿主物品仍在背包里（按对象同一性）。若被挪位就更新槽位记录，
-            // 若彻底找不到则告警——用于定位「宿主被顶替/丢失」类问题。
-            int actual = findSlot(inv);
-            if (actual >= 0) {
-                slotIndex = actual;
-            } else {
-                LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) is NOT in player inventory any more",
-                        shulkerBoxStack.getItem(), slotIndex);
-            }
-            inv.setChanged();
-        } else if (parent != null) {
-            // 嵌套：父容器已持有本物品对象，触发其重新序列化即可逐级向上传播
+        // v1.2.5：先重定位宿主（若被外部操作替换成新对象，则接管真实对象），
+        // 再写入内容，避免写回落在孤儿对象上造成「取出不消失」的复制。
+        relocateHost();
+        if (shulkerBoxStack != null && !shulkerBoxStack.isEmpty()) {
+            shulkerBoxStack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(items));
+        }
+        if (parent != null) {
             parent.setChanged();
         }
     }
 
-    /** 在背包里按对象同一性查找本宿主物品所在槽位，找不到返回 -1。 */
-    private int findSlot(Inventory inv) {
-        int size = inv.getContainerSize();
+    /** 在父容器里按对象同一性查找本宿主物品所在槽位，找不到返回 -1。 */
+    private int findSlot(Container c) {
+        int size = c.getContainerSize();
         for (int i = 0; i < size; i++) {
-            if (inv.getItem(i) == shulkerBoxStack) {
+            if (c.getItem(i) == shulkerBoxStack) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 在父容器里按对象同一性查找指定物品所在槽位，找不到返回 -1。 */
+    private static int findSlotOf(Container c, ItemStack target) {
+        int size = c.getContainerSize();
+        for (int i = 0; i < size; i++) {
+            if (c.getItem(i) == target) {
                 return i;
             }
         }
@@ -294,6 +303,67 @@ public class ShulkerBoxItemContainer implements Container {
     /** 宿主在父容器中的槽位记录（可能随写回自动校正）。 */
     public int getSlotIndex() {
         return slotIndex;
+    }
+
+    /**
+     * 重定位宿主引用：确保 writeBack 作用于「父容器中真实存在的对象」。
+     *
+     *  - 同一性优先：宿主对象仍在父容器中（可能被 GUI 挪到别的槽位），只校正 slotIndex；
+     *  - 对象已被替换（一键整理等会重建堆叠对象）：接管父容器中「唯一同类型」的
+     *    替换对象（优先记录槽位，其次全容器唯一匹配），让后续写回落在真实对象上；
+     *  - 找不到 / 有歧义：保持原引用，仅告警（延续 v1.2.4 探针行为）。
+     */
+    private void relocateHost() {
+        if (parent == null || shulkerBoxStack == null || shulkerBoxStack.isEmpty()) {
+            return;
+        }
+        // 同一性优先：宿主对象仍在父容器中（可能被挪到别的槽位）
+        int idSlot = findSlot(parent);
+        if (idSlot >= 0) {
+            if (idSlot != slotIndex) {
+                slotIndex = idSlot;
+            }
+            return;
+        }
+        // 对象被替换：尝试接管真实对象
+        ItemStack replacement = findReplacement(parent);
+        if (replacement != null && !replacement.isEmpty()) {
+            int repSlot = findSlotOf(parent, replacement);
+            LOGGER.warn("[SB-FIX] host {} re-anchored (recorded slot {} -> slot {}) after external replacement",
+                    replacement.getItem(), slotIndex, repSlot);
+            shulkerBoxStack = replacement;
+            slotIndex = repSlot;
+            return;
+        }
+        // 彻底找不到：延续 v1.2.4 告警，用于定位「宿主被顶替/丢失」
+        LOGGER.warn("[SB-ALERT] host {} (recorded slot {}) is NOT in player inventory any more",
+                shulkerBoxStack.getItem(), slotIndex);
+    }
+
+    /**
+     * 宿主对象被替换后，在父容器中找回「真实宿主」。
+     * 规则：优先记录槽位（若仍是同类型潜影盒）；否则全容器唯一同类型。
+     * 多个同类型导致无法唯一判定时返回 null（宁可告警，也不写错盒子）。
+     */
+    private ItemStack findReplacement(Container parent) {
+        if (slotIndex >= 0 && slotIndex < parent.getContainerSize()) {
+            ItemStack atRecorded = parent.getItem(slotIndex);
+            if (atRecorded != null && !atRecorded.isEmpty()
+                    && atRecorded.getItem() == shulkerBoxStack.getItem()) {
+                return atRecorded;
+            }
+        }
+        ItemStack only = null;
+        int count = 0;
+        int size = parent.getContainerSize();
+        for (int i = 0; i < size; i++) {
+            ItemStack s = parent.getItem(i);
+            if (s != null && !s.isEmpty() && s.getItem() == shulkerBoxStack.getItem()) {
+                count++;
+                only = s;
+            }
+        }
+        return count == 1 ? only : null;
     }
 
     /**
