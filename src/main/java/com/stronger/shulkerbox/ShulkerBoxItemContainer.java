@@ -3,6 +3,7 @@ package com.stronger.shulkerbox;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
@@ -34,24 +35,20 @@ import java.util.Set;
 public class ShulkerBoxItemContainer implements Container {
     private static final int SIZE = 27;
 
-    /** 服务端：当前正在被打开的潜影盒物品（按对象同一性），用于阻止自包含/祖先包含。 */
-    private static final Set<ItemStack> SERVER_OPEN =
-            Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
-    /** 客户端：同上（客户端与服务端各自维护，互不干扰）。 */
+    /**
+     * 客户端本地镜像：当前正在打开的宿主盒子（客户端与服务端各自维护集合）。
+     *
+     * v1.2.3 起，服务端不再使用「全局标记集合」，而是实时查询打开链
+     *（{@link ShulkerBoxStackManager#isOpenHost}/{@link ShulkerBoxStackManager#isAnyOpenHost}），
+     * 从根本上避免「残留标记把不该锁的盒子也锁住」。此集合仅用于客户端侧校验。
+     */
     private static final Set<ItemStack> CLIENT_OPEN =
             Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
 
-    public static void markOpenServer(ItemStack stack) {
-        if (stack != null && !stack.isEmpty()) SERVER_OPEN.add(stack);
-    }
-
-    public static void unmarkOpenServer(ItemStack stack) {
-        if (stack != null) SERVER_OPEN.remove(stack);
-    }
-
-    public static void clearOpenServer() {
-        SERVER_OPEN.clear();
-    }
+    /** 临时诊断：每个被判定为「打开中」的物品只打印一次，用于定位误锁。 */
+    private static final Set<ItemStack> DIAG_LOGGED =
+            Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger("strongershulkerbox");
 
     public static void markOpenClient(ItemStack stack) {
         if (stack != null && !stack.isEmpty()) CLIENT_OPEN.add(stack);
@@ -61,10 +58,35 @@ public class ShulkerBoxItemContainer implements Container {
         CLIENT_OPEN.clear();
     }
 
-    /** 该物品是否正作为某个（本层/祖先层）已打开潜影盒的宿主物品。 */
+    /**
+     * 该物品是否为「某个玩家当前打开链中的宿主盒子」（拿不到 Player 时使用，如 mayPlace）。
+     * 判据完全来自实时打开链 + 客户端镜像，不存在任何残留标记。
+     */
     public static boolean isOpenBacking(ItemStack stack) {
-        return stack != null && !stack.isEmpty()
-                && (SERVER_OPEN.contains(stack) || CLIENT_OPEN.contains(stack));
+        if (stack == null || stack.isEmpty()) {
+            return false;
+        }
+        if (CLIENT_OPEN.contains(stack)) {
+            return true;
+        }
+        return ShulkerBoxStackManager.isAnyOpenHost(stack);
+    }
+
+    /**
+     * 该物品是否为「该玩家当前打开链中的宿主盒子」（精确到具体玩家，如 mayPickup）。
+     * 打开 X 时链中只有 X，故 X 内的 Y 不会命中，可正常取出。
+     */
+    public static boolean isOpenBackingFor(Player player, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return false;
+        }
+        boolean clientHit = CLIENT_OPEN.contains(stack);
+        boolean hostHit = player instanceof ServerPlayer sp && ShulkerBoxStackManager.isOpenHost(sp, stack);
+        boolean locked = clientHit || hostHit;
+        if (locked && DIAG_LOGGED.add(stack)) {
+            LOGGER.info("[SB-DIAG] lock item={} clientHit={} openHost={}", stack.getItem(), clientHit, hostHit);
+        }
+        return locked;
     }
 
     /** 权威后备存储（可变） */

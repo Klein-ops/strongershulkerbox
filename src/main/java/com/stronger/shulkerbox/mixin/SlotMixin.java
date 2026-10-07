@@ -43,8 +43,10 @@ public abstract class SlotMixin {
 
     @Inject(method = "mayPickup(Lnet/minecraft/world/entity/player/Player;)Z", at = @At("HEAD"), cancellable = true)
     private void sbs$lockOpenShulkerBoxSlot(Player player, CallbackInfoReturnable<Boolean> cir) {
-        if (ShulkerBoxItemContainer.isOpenBacking(this.getItem())) {
-            // 该槽位里是「正在打开的潜影盒」：不允许被取走 / 丢弃 / 交换
+        if (ShulkerBoxItemContainer.isOpenBackingFor(player, this.getItem())) {
+            // 该槽位里是「该玩家当前打开链中的宿主潜影盒」：
+            // 不允许被取走 / 丢弃 / 交换。
+            // 注意：只锁「正在打开的宿主盒子」本身，盒子内部的其它潜影盒不受影响。
             cir.setReturnValue(false);
         }
     }
